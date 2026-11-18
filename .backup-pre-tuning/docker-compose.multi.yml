@@ -1,0 +1,114 @@
+# UrNetwork 3.23-fix — multiple provider instances on one host.
+#
+# Each container is an INDEPENDENT provider identity: its own client JWT,
+# its own .provider.key, its own client_id, its own proxy pool, its own
+# dashboard label. Three separate state volumes — that's what makes them
+# distinct on the backend. (A shared volume would give all three the same
+# .provider.key and the same client_id, so the dashboard would dedup them
+# to one entry.)
+#
+# Auth: each node reads AUTH/USER_AUTH/PASSWORD from .env and signs in
+# independently. With AUTH=userpass the same credentials work for all three,
+# so no sharing is needed. Use AUTH=authcode + URNETWORK_AUTH_CODE for a
+# one-time code (JWT cached in that node's own volume, consumed once).
+#
+# NOTE: do NOT set BUILD=jwt with AUTH=userpass — BUILD takes precedence
+# and forces JWT mode, which demands a token on first run. With AUTH=userpass
+# simply omit BUILD; the entrypoint selects the auth mode from AUTH.
+#
+# Device-IP strategy (egress source IPs, not ISP-issued IPs):
+#   The host has one physical IP. To give each instance a distinct
+#   source IP, attach a virtual interface per node BEFORE starting:
+#     ip link add dummy0 type dummy
+#     ip addr add 10.0.0.1/32 dev dummy0
+#     ip link set dummy0 up
+#   Then bind each node to it with --network host + URNETWORK_EGRESS_IP,
+#   or run each container with its own macvlan/ipvlan parent.
+#   The provider accepts --test-egress-source-ip=<ip> to verify egress.
+#
+# proxy.txt is NOT mounted. The provider refuses to start when a mounted
+# proxy file exists but has no valid servers. On first boot each node runs
+# in `direct` mode (provides via its own device IP, no proxies needed).
+# Add proxies later without restart:
+#     urnet-tools proxy add ~/proxies.txt
+#     urnet-tools proxy refresh
+# To mount a real proxy list, copy it to ./proxy.txt (real entries, not
+# comments) and add the volume line back under each node's `volumes:`.
+#
+# Ports: providers need no INBOUND peer ports. The metrics endpoint
+# (9100+N) stays inside each container.
+#
+# Usage:
+#   sh urnet-start.sh              bring the stack up
+#   sh urnet-start.sh --stop       stop, keep the per-node volumes
+#   sh urnet-start.sh --kill       stop AND wipe the per-node volumes
+#   sh urnet-start.sh --teardown   tear down the virtual interfaces
+
+services:
+  node-1:
+    image: ghcr.io/full-bars/urnetwork-3.23-fix:latest
+    container_name: urfix-1
+    restart: unless-stopped
+    pull_policy: always
+    cap_add: [NET_ADMIN, NET_RAW]
+    sysctls:
+      - net.ipv4.ip_forward=1
+    env_file: .env
+    environment:
+      - HOST_HOSTNAME=${HOSTNAME:-laptop}
+      - URNETWORK_NODE_NAME=urfix-1
+      # - URNETWORK_EGRESS_IP=10.0.0.1           # optional, per-node source IP
+    volumes:
+      - ur_config_1:/root/.urnetwork              # THIS node's identity only
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  node-2:
+    image: ghcr.io/full-bars/urnetwork-3.23-fix:latest
+    container_name: urfix-2
+    restart: unless-stopped
+    pull_policy: always
+    cap_add: [NET_ADMIN, NET_RAW]
+    sysctls:
+      - net.ipv4.ip_forward=1
+    env_file: .env
+    environment:
+      - HOST_HOSTNAME=${HOSTNAME:-laptop}
+      - URNETWORK_NODE_NAME=urfix-2
+      # - URNETWORK_EGRESS_IP=10.0.0.2
+    volumes:
+      - ur_config_2:/root/.urnetwork              # THIS node's identity only
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  node-3:
+    image: ghcr.io/full-bars/urnetwork-3.23-fix:latest
+    container_name: urfix-3
+    restart: unless-stopped
+    pull_policy: always
+    cap_add: [NET_ADMIN, NET_RAW]
+    sysctls:
+      - net.ipv4.ip_forward=1
+    env_file: .env
+    environment:
+      - HOST_HOSTNAME=${HOSTNAME:-laptop}
+      - URNETWORK_NODE_NAME=urfix-3
+      # - URNETWORK_EGRESS_IP=10.0.0.3
+    volumes:
+      - ur_config_3:/root/.urnetwork              # THIS node's identity only
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  ur_config_1:
+  ur_config_2:
+  ur_config_3:

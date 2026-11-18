@@ -1,0 +1,27 @@
+# urnet-boot.service — runs urnet-start.sh at boot.
+#
+# Install (as root, on the host):
+#   sudo cp urnet-boot.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now urnet-boot.service
+#
+# The script reads .env itself, so nothing has to be passed in here.
+# Change the fleet in .env, not in this file.
+[Unit]
+Description=UrNetwork 3.23-fix multi-provider fleet
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+# Wait for the Docker daemon to actually answer, not just to be "started".
+ExecStartPre=/bin/sh -c 'for i in $(seq 1 30); do docker info >/dev/null 2>&1 && exit 0; sleep 1; done; echo "docker not ready" >&2; exit 1'
+# Repository location. This was previously /Code/ur/, which does not exist,
+# so the unit failed at boot. Keep it in sync with where this repo lives.
+Environment=URNET_REPO=/home/solis/Documentos/Code/urn
+ExecStart=/bin/sh -c 'exec /bin/sh "$URNET_REPO/urnet-start.sh"'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

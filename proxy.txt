@@ -1,0 +1,27 @@
+# UrNetwork proxy list — one per line.
+#
+# Format (any of these):
+#   host:port
+#   host:port:user:pass
+#   user:pass@host:port
+#   http://user:pass@host:port        (scheme is optional; provider strips it)
+#   socks5://host:port
+#
+# Blank lines and lines starting with # are ignored.
+# ~ expands to your home directory.
+#
+# This file is mounted read-only into every container (node-1..3), so all
+# three provider identities load the same pool. Each identity registers its
+# own client JWT with the backend, so the same proxy addresses get separate
+# client IDs per node — that's the point of running multiple instances.
+#
+# Fill in real proxies below and delete this header block, or leave it as
+# documentation. The provider starts fine with an empty pool; you can add
+# proxies later with:  urnet-tools proxy add ~/proxies.txt
+#                              urnet-tools proxy refresh
+
+# --- example lines (delete or replace these) ---
+# 192.0.2.1:1080
+# 203.0.113.7:8888:user:pass123
+# http://user:pass@198.51.100.23:3128
+# socks5://192.0.2.44:1080

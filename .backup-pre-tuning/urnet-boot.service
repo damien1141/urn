@@ -1,0 +1,24 @@
+# urnet-boot.service — runs urnet-start.sh at boot.
+#
+# Install (as root, on the host):
+#   cp urnet-boot.service /etc/systemd/system/
+#   systemctl daemon-reload
+#   systemctl enable --now urnet-boot.service
+#
+# It waits for Docker to be up, then runs the start script.
+# Edit URNETWORK_AUTH_CODE inside urnet-start.sh (or pass it in the
+# environment) — that's the only thing you change.
+[Unit]
+Description=UrNetwork 3.23-fix multi-provider
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStartPre=/bin/sh -c 'for i in $(seq 1 30); do docker info >/dev/null 2>&1 && exit 0; sleep 1; done; echo "docker not ready" >&2; exit 1'
+ExecStart=/bin/sh /home/solis/Documentos/Code/ur/urnet-start.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
