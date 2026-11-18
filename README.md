@@ -20,11 +20,20 @@ it. Two things limit that here:
 With no proxy list, each container runs a single `direct` identity: one machine,
 one public IP, competing as one peer. `urnet-tools proxy summary` on a fresh
 fleet reports `Total proxies: 0`. Adding proxies is what multiplies the number of
-identities and the volume routed to you:
+identities and the volume routed to you. Put them in `proxies.txt` (shipped, header-only until you fill it) and point
+`.env` at it:
+
+```env
+PROXY_FILE=/home/solis/Documentos/Code/urn/proxies.txt
+```
+
+The script mounts it read-only into every container and skips it entirely
+while the file has no real entries, so an untouched `proxies.txt` changes
+nothing. Add entries or refresh without a restart:
 
 ```sh
-urnet-tools proxy add ~/proxies.txt   # host:port or host:port:user:pass
-urnet-tools proxy refresh
+docker exec urfix-1 urnet-tools proxy add /app/proxy.txt
+docker exec urfix-1 urnet-tools proxy refresh   # --force within 8-12h of a restart
 ```
 
 **2. All containers share one public IP.**
@@ -205,7 +214,7 @@ Useful log lines:
 | `urnet-start.sh` | Bring the fleet up / status / stop / kill |
 | `urnet-boot.service` | systemd unit to run it at boot |
 | `.env` | **the only thing you edit** |
-| `proxy.txt` | Proxy list template (one per line) |
+| `proxies.txt` | Proxy list — **the bandwidth lever** (see above) |
 | `docker-compose.multi.yml` | Reference 3-node compose template (static) |
 | `urnetwork-3.23-fix/docs/` | Upstream docs — read `Adding-Proxies.md` and `High-Volume-Performance-Tuning.md` |
 

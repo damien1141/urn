@@ -82,6 +82,21 @@ METRICS="${METRICS:-on}"
 PROXY_FILE="$(env_get PROXY_FILE)"        # host path, optional
 SELF_HEAL="$(env_get URNETWORK_SELF_HEAL)"
 
+# Count real proxy lines (not comments, not blank) so a header-only file
+# is treated as "no proxies" rather than mounted and rejected by the
+# entrypoint. ~ expands here, once, for the shell.
+case "$PROXY_FILE" in
+  "~/"*) PROXY_FILE="$HOME/${PROXY_FILE#\~/}" ;;
+esac
+PROXY_ENTRIES=0
+if [ -n "$PROXY_FILE" ] && [ -f "$PROXY_FILE" ]; then
+  # grep -c exits 1 when it counts zero, so `|| echo 0` would append a
+  # second 0 and produce "0\n0". Count into a var and coerce after.
+  _pe="$(grep -cvE '^[[:space:]]*(#|$)' "$PROXY_FILE" 2>/dev/null || true)"
+  case "$_pe" in ''|*[!0-9]*) _pe=0 ;; esac
+  PROXY_ENTRIES="$_pe"
+fi
+
 # Fleet-wide bandwidth cap, in MB/s (megabytes, not megabits).
 #   N  = total for the whole fleet, split evenly across containers
 #   0  = no limit
@@ -445,8 +460,10 @@ for i in $(seq 1 "$COUNT"); do
   esac
 
   # A proxy source is the difference between "provider is up" and
-  # "provider is earning". Mount it when the file exists and has entries.
-  if [ -n "$PROXY_FILE" ] && [ -s "$PROXY_FILE" ]; then
+  # "provider is earning". Mount it only when it has real entries: the
+  # entrypoint imports the file and warns "no valid servers" for a file
+  # that is only comments, so gate on line count, not on file size.
+  if [ -n "$PROXY_FILE" ] && [ -f "$PROXY_FILE" ] && [ "$PROXY_ENTRIES" -gt 0 ]; then
     set -- "$@" -v "$PROXY_FILE:/app/proxy.txt:ro" -e PROXY_FILE=/app/proxy.txt
   fi
   if [ -n "$SELF_HEAL" ]; then set -- "$@" -e URNETWORK_SELF_HEAL="$SELF_HEAL"; fi

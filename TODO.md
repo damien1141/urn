@@ -19,3 +19,7 @@
 - [x] Fix cached-JWT path crash-looping the fleet (userpass needs creds)
 - [x] Single log read per container in --status; "-" instead of confusing "?"
 - [x] Move image pull above the cached-JWT probe that uses the image
+- [x] Ship proxies.txt (header-only, RFC 5737 examples, real formats verified)
+- [x] Gate the mount on real entry count, not file size
+- [x] Fix grep -c "0\n0" bug that broke the entry test
+- [x] Wire PROXY_FILE into .env_example + README; drop redundant proxy.txt

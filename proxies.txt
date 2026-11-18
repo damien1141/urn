@@ -1,0 +1,53 @@
+# proxies.txt — the bandwidth lever for this fleet.
+#
+# A provider with no proxies runs ONE `direct` identity: a single machine
+# on a single public IP, competing as one peer. Proxies multiply the
+# identities and the volume the network routes to you, which is what
+# grows billable traffic.
+#
+# Points urnet-start.sh at this file (in .env):
+#   PROXY_FILE=/home/solis/Documentos/Code/urn/proxies.txt
+#
+# Then:  sh urnet-start.sh
+# The script mounts it read-only into every container and skips it
+# entirely while this file has no real entries (comments do not count).
+
+# ─── Format ──────────────────────────────────────────────────────────
+# One proxy per line. Any of these shapes is accepted:
+#
+#   host:port
+#   host:port:user:pass
+#   user:pass@host:port
+#   http://user:pass@host:port        (scheme optional; stripped)
+#   socks5://host:port
+#
+# Blank lines and lines starting with # are ignored.
+# ~ expands to your home directory.
+
+# ─── Example lines (uncomment and replace with real proxies) ─────────
+# 192.0.2.1:1080
+# 203.0.113.7:8888:user:pass123
+# http://user:pass@198.51.100.23:3128
+# socks5://192.0.2.44:1080
+
+# ─── Notes that actually matter ──────────────────────────────────────
+# 1. The addresses above are RFC 5737 documentation ranges. They are not
+#    real proxies. Nothing here works until you add your own.
+#
+# 2. Every container loads the same pool, but each registers its own
+#    client JWT, so the same proxy address gets a separate client ID
+#    per node. That is intentional and is the point of N instances.
+#
+# 3. All containers still egress through the host's one public IP unless
+#    the proxies themselves are elsewhere. Proxy IPs are what give you
+#    distinct network origins — not dummy interfaces (see README).
+#
+# 4. Add or change proxies without restarting:
+#      docker exec urfix-1 urnet-tools proxy add /app/proxy.txt
+#      docker exec urfix-1 urnet-tools proxy refresh
+#    A refresh may refuse within 8-12h of a provider restart (warmup
+#    lockout); add --force to bypass.
+#
+# 5. Check what is actually live:
+#      docker exec urfix-1 urnet-tools proxy summary
+#      docker exec urfix-1 urnet-tools proxy health
