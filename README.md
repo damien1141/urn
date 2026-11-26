@@ -20,8 +20,51 @@ it. Two things limit that here:
 With no proxy list, each container runs a single `direct` identity: one machine,
 one public IP, competing as one peer. `urnet-tools proxy summary` on a fresh
 fleet reports `Total proxies: 0`. Adding proxies is what multiplies the number of
-identities and the volume routed to you. Put them in `proxies.txt` (shipped, header-only until you fill it) and point
-`.env` at it:
+identities and the volume routed to you.
+
+**Preferred: a live feed.** Set `PROXY_URL` and the provider fetches, dedupes,
+grades and reaps by itself — no cron, no scripts. [Proxifly](https://github.com/proxifly/free-proxy-list)
+republishes and validates every 5 minutes:
+
+```env
+PROXY_URL=https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/protocols/socks5/data.txt
+PROXY_URL_REFRESH=1h
+PROXY_URL_MAX=150
+```
+
+Measured on one node against that feed: 5709 listed → 5684 dialed → 83
+reachable → **25 admitted** (`A=25 B=8 D=4 F=46`). The funnel is the point:
+free proxies are mostly dead, and only graded ones ever carry traffic. Anything
+that fails is rejected, and dead entries are pruned on a 6h cadence, so a
+decaying feed degrades toward `direct` instead of breaking the node.
+
+Use SOCKS5 — the provider speaks it natively. If you are on a metered
+connection, note the daily job downloads the whole list (~5.7k lines) per
+node per refresh.
+
+### Keeping one node on your own IP
+
+Nodes `1..URNETWORK_DIRECT_NODES` get **no proxy source at all**, so their
+traffic leaves through this host's own connection. That is the node the network
+sees as a real residential exit, which is what it scores best. Everything above
+`N` takes the feed.
+
+```env
+URNETWORK_DIRECT_NODES=1    # urfix-1 residential, urfix-2..6 proxied
+```
+
+Pin the node that already has earnings history — switching a node from proxied
+to residential keeps its `client_id`, but starting fresh loses the warm-up.
+
+A subtlety worth knowing: unsetting `PROXY_URL` is **not** enough to make a node
+residential. Proxies persist in the state volume, so the node keeps running
+`mode=mixed` until they are cleared. The script handles this — after a
+residential node is up it runs `urnet-tools proxy clear --force`, and logs
+`cleared persisted proxies (now direct-only)`. Without that step the node still
+egresses through proxies despite having no feed configured.
+
+**Or a static file.** Put entries in `proxies.txt` (shipped, header-only until
+you fill it) and point `.env` at it:
 
 ```env
 PROXY_FILE=/home/solis/Documentos/Code/urn/proxies.txt
@@ -82,7 +125,13 @@ Optional tuning (defaults are sane; leave unset unless you have a reason):
 | `URNETWORK_NOFILE` | `1048576` | Open-file limit for the container. A proxy fleet needs many sockets. |
 | `PROXY_FILE` | *(unset)* | Host path to a proxy list; mounted into each container when it has entries. |
 | `URNETWORK_SELF_HEAL` | *(unset)* | Set `1` to enable the pressure-adaptive pool controller. |
-| `URNETWORK_BANDWIDTH_CAP_MBPS` | `0` | Fleet-wide cap in **MB/s**, enforced as a total and split evenly across containers. `0` or `-1` = no limit. |
+| `URNETWORK_BANDWIDTH_CAP_KBPS` | `0` | Fleet-wide cap in **KB/s**, enforced as a total and split evenly across containers. `0` or `-1` = no limit. |
+| `URNETWORK_MEMORY_CAP_MB` | `0` | Fleet-wide **memory** ceiling in MiB, split evenly. `0` = no limit. |
+| `URNETWORK_CPU_CAP_PCT` | `0` | Fleet-wide **CPU** ceiling as percent of host cores, split evenly. `0` = no limit. |
+| `PROXY_URL` | *(unset)* | Live proxy feed. Fetched, graded and reaped by the provider. Preferred over a static file. |
+| `PROXY_URL_MAX` | `500` | Most proxies admitted from `PROXY_URL`. |
+| `PROXY_URL_REFRESH` | `1h` | How often the feed is re-fetched for new entries. |
+| `URNETWORK_DIRECT_NODES` | `1` | Nodes `1..N` run residential-only (own IP, no proxies). `0` = all may take proxies. |
 
 The script never echoes credential values, and it does not print them in
 errors — a wrong `AUTH` or a missing value is reported by name only.
@@ -111,6 +160,35 @@ for lack of proxies or for another reason.
 
 ---
 
+## Memory and CPU ceilings
+
+Both are **totals for the whole fleet**, split evenly across containers, and `0`
+means no limit:
+
+```env
+URNETWORK_MEMORY_CAP_MB=20000     # 20 GiB for the fleet
+URNETWORK_CPU_CAP_PCT=1200        # ~12 cores for the fleet
+```
+
+With 6 containers that is 3333 MiB and 200% (~2 cores) each. Shares round
+**down**, so the fleet can never exceed the total you set.
+
+`URNETWORK_CPU_CAP_PCT` is percent of host CPUs: `100` = every core once, `200` =
+two cores. On a 22-core box, `1200` ≈ 12 cores.
+
+Why Docker and not the provider's own profiles: the provider's tuning profile
+sizes buffers from the RAM it thinks it has, and it reads its cgroup limit. A
+container limit therefore constrains it correctly, whereas the profile alone
+does not cap anything. Memory is set with `--memory` **and** `--memory-swap` to
+the same value, which disables swap for the container — a node hitting its
+ceiling gets OOM-killed and restarted by `unless-stopped` rather than dragging
+the whole host into swap thrash.
+
+Minimum shares are enforced (6 MiB and 10% CPU per container); below that the
+script refuses rather than handing Docker a value it rejects.
+
+---
+
 ## Bandwidth cap
 
 The provider has **no internal rate limiter** — there is no upstream env var for
@@ -119,14 +197,14 @@ this, so the cap is enforced with `tc` on each container's network namespace.
 Set a fleet-wide total in `.env`:
 
 ```env
-URNETWORK_BANDWIDTH_CAP_MBPS=6     # 6 MB/s for the whole fleet
+URNETWORK_BANDWIDTH_CAP_KBPS=6000  # 6000 KB/s (6 MB/s) for the whole fleet
 ```
 
-Units are **megabytes** per second, not megabits. `1 MB/s = 8 Mbit/s`.
+Units are **kilobytes** per second, not kilobits: `1000 KB/s = 1 MB/s = 8 Mbit/s`.
 
 | Value | Meaning |
 |---|---|
-| `6` | 6 MB/s total (≈48 Mbit/s), split evenly across containers |
+| `6000` | 6000 KB/s (6 MB/s, ≈48 Mbit/s) total, split evenly across containers |
 | `0` | no limit |
 | `-1` | no limit (explicit "infinite") |
 
@@ -135,8 +213,8 @@ container count lowers each one and the fleet total stays put:
 
 | Cap | 1 node | 3 nodes | 6 nodes | 10 nodes |
 |---|---|---|---|---|
-| 6 MB/s | 6 MB/s | 2 MB/s | 1 MB/s | 0.6 MB/s |
-| 12 MB/s | 12 MB/s | 4 MB/s | 2 MB/s | 1.2 MB/s |
+| 6000 KB/s | 6000 | 2000 | 1000 | 600 |
+| 12000 KB/s | 12000 | 4000 | 2000 | 1200 |
 
 Both directions are shaped: egress with a token bucket on `eth0`, ingress by
 redirecting into a per-container `ifb` device.

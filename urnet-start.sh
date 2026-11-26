@@ -33,6 +33,13 @@ cd "$REPO_DIR"
 log() { echo "[urnet-start] $*"; }
 die() { echo "[urnet-start] ERROR: $*" >&2; exit 1; }
 
+require_uint() {
+  case "$2" in
+    ''|*[!0-9]*) die "$1 must be a whole number >= 0 (0 = no limit), got '$2'" ;;
+  esac
+}
+
+
 # --- flags -----------------------------------------------------------
 STOP=0
 KILL=0
@@ -97,22 +104,92 @@ if [ -n "$PROXY_FILE" ] && [ -f "$PROXY_FILE" ]; then
   PROXY_ENTRIES="$_pe"
 fi
 
-# Fleet-wide bandwidth cap, in MB/s (megabytes, not megabits).
+# Live proxy feed. Preferred over PROXY_FILE for rotating lists: the
+# provider fetches it, dedupes against what is already running, grades
+# each candidate, and reaps dead entries on its own cadence. Never
+# disturbs proxies that are already warmed up.
+PROXY_URL="$(env_get PROXY_URL)"
+PROXY_URL_REFRESH="$(env_get PROXY_URL_REFRESH)"
+PROXY_URL_REFRESH="${PROXY_URL_REFRESH:-1h}"
+PROXY_URL_MAX="$(env_get PROXY_URL_MAX)"
+PROXY_URL_MAX="${PROXY_URL_MAX:-500}"
+
+# How many nodes run residential-only (no proxy source). Those nodes use
+# this host's own connection, which is what the network sees as a real
+# residential exit. The rest get the proxy feed.
+#   0  = every node may take proxies
+#   1  = keep node #1 on the residential IP (default)
+# Pin the node that already has history so its earnings are not reset.
+DIRECT_NODES="$(env_get URNETWORK_DIRECT_NODES)"
+DIRECT_NODES="${DIRECT_NODES:-1}"
+require_uint URNETWORK_DIRECT_NODES "$DIRECT_NODES"
+if [ "$DIRECT_NODES" -gt "$COUNT" ]; then
+  die "URNETWORK_DIRECT_NODES=$DIRECT_NODES is more than URNETWORK_INSTANCE_COUNT=$COUNT"
+fi
+require_uint PROXY_URL_MAX "$PROXY_URL_MAX"
+case "$PROXY_URL" in
+  '') ;;
+  http://*|https://*|*://*) ;;
+  *) die "PROXY_URL must start with http:// or https://, got '$PROXY_URL'" ;;
+esac
+
+# Fleet-wide memory and CPU ceilings. Each is a TOTAL for all containers,
+# split evenly, and 0 means no limit.
+#   URNETWORK_MEMORY_CAP_MB   total MiB for the fleet  (0 = unlimited)
+#   URNETWORK_CPU_CAP_PCT     total percent of host CPUs (0 = unlimited,
+#                             100 = every core once, so 200 = two cores)
+# Docker enforces these per container, which makes them a hard ceiling
+# regardless of what the provider's own tuning thinks it has.
+MEM_CAP_MB="$(env_get URNETWORK_MEMORY_CAP_MB)"
+MEM_CAP_MB="${MEM_CAP_MB:-0}"
+CPU_CAP_PCT="$(env_get URNETWORK_CPU_CAP_PCT)"
+CPU_CAP_PCT="${CPU_CAP_PCT:-0}"
+
+require_uint URNETWORK_MEMORY_CAP_MB "$MEM_CAP_MB"
+require_uint URNETWORK_CPU_CAP_PCT "$CPU_CAP_PCT"
+
+# Per-container share, rounded down, so COUNT containers can never exceed
+# the total. A share below the minimum is refused rather than silently
+# producing a container the runtime rejects.
+MEM_PER_MB=0
+CPU_PER_PCT=0
+if [ "$MEM_CAP_MB" -gt 0 ]; then
+  MEM_PER_MB=$(( MEM_CAP_MB / COUNT ))
+  if [ "$MEM_PER_MB" -lt 6 ]; then
+    die "URNETWORK_MEMORY_CAP_MB=$MEM_CAP_MB over $COUNT containers is under 6 MiB each; raise the cap or lower the count"
+  fi
+fi
+if [ "$CPU_CAP_PCT" -gt 0 ]; then
+  CPU_PER_PCT=$(( CPU_CAP_PCT / COUNT ))
+  if [ "$CPU_PER_PCT" -lt 10 ]; then
+    die "URNETWORK_CPU_CAP_PCT=$CPU_CAP_PCT over $COUNT containers is under 10% each; raise the cap or lower the count"
+  fi
+fi
+
+# Fleet-wide bandwidth cap, in KB/s (kilobytes per second).
 #   N  = total for the whole fleet, split evenly across containers
 #   0  = no limit
 #  -1  = no limit (explicit "infinite")
+# Kilobytes, not kilobits: 1000 KB/s = 8 Mbit/s.
 # The provider has no internal rate limiter, so this is enforced with tc
 # on each container's network namespace. It caps both directions.
-CAP_MBPS="$(env_get URNETWORK_BANDWIDTH_CAP_MBPS)"
-CAP_MBPS="${CAP_MBPS:-0}"
+CAP_KBPS="$(env_get URNETWORK_BANDWIDTH_CAP_KBPS)"
+CAP_KBPS="${CAP_KBPS:-0}"
+# The old key was URNETWORK_BANDWIDTH_CAP_MBPS. A .env left over from it
+# would silently mean "no cap", so refuse instead of guessing a unit.
+_legacy_cap="$(env_get URNETWORK_BANDWIDTH_CAP_MBPS)"
+if [ -n "$_legacy_cap" ]; then
+  die "URNETWORK_BANDWIDTH_CAP_MBPS is retired — use URNETWORK_BANDWIDTH_CAP_KBPS (kilobytes per second, so 1000 = 8 Mbit/s)"
+fi
+
 # Accept exactly -1 (no limit) or a run of digits. Anything else -- "-",
 # "1-2", "5-", "3.5" -- would pass a looser pattern and then crash the
 # arithmetic below, so the pattern stays strict here.
-case "$CAP_MBPS" in
-  -1) CAP_MBPS=0 ;;
-  '') die "URNETWORK_BANDWIDTH_CAP_MBPS is set but empty (0 or -1 = no limit)" ;;
+case "$CAP_KBPS" in
+  -1) CAP_KBPS=0 ;;
+  '') die "URNETWORK_BANDWIDTH_CAP_KBPS is set but empty (0 or -1 = no limit)" ;;
   *[!0-9]*)
-    die "URNETWORK_BANDWIDTH_CAP_MBPS must be a whole number in MB/s (0 or -1 = no limit), got '$CAP_MBPS'"
+    die "URNETWORK_BANDWIDTH_CAP_KBPS must be a whole number in KB/s (0 or -1 = no limit), got '$CAP_KBPS'"
     ;;
 esac
 
@@ -137,10 +214,34 @@ plausible_cred() {
 
 # --- status (read-only) ----------------------------------------------
 if [ "$STATUS" -eq 1 ]; then
-  if [ "$CAP_MBPS" -gt 0 ]; then
-    log "fleet: $COUNT configured, requested profile: $PROFILE, cap ${CAP_MBPS}MB/s total"
+  if [ "$CAP_KBPS" -gt 0 ]; then
+    _bw="cap ${CAP_KBPS}KB/s total"
   else
-    log "fleet: $COUNT configured, requested profile: $PROFILE, cap none"
+    _bw="cap none"
+  fi
+  if [ "$MEM_CAP_MB" -gt 0 ]; then
+    _mem="${MEM_CAP_MB}MiB total (${MEM_PER_MB}MiB each)"
+  else
+    _mem="none"
+  fi
+  if [ "$CPU_CAP_PCT" -gt 0 ]; then
+    _cpu="${CPU_CAP_PCT}% total (${CPU_PER_PCT}% each)"
+  else
+    _cpu="none"
+  fi
+  log "fleet: $COUNT configured, requested profile: $PROFILE, bandwidth $_bw"
+  log "       memory limit: $_mem | cpu limit: $_cpu"
+  if [ "$DIRECT_NODES" -gt 0 ]; then
+    log "       nodes 1-$DIRECT_NODES: residential (own IP, no proxies)"
+  fi
+  if [ "$DIRECT_NODES" -lt "$COUNT" ]; then
+    if [ -n "$PROXY_URL" ]; then
+      log "       nodes $((DIRECT_NODES + 1))-$COUNT: feed $PROXY_URL_MAX max, refresh $PROXY_URL_REFRESH"
+    elif [ "$PROXY_ENTRIES" -gt 0 ]; then
+      log "       nodes $((DIRECT_NODES + 1))-$COUNT: $PROXY_ENTRIES entries from $PROXY_FILE"
+    else
+      log "       nodes $((DIRECT_NODES + 1))-$COUNT: no proxy source (direct-only)"
+    fi
   fi
   echo
   printf '%-10s %-9s %-8s %-9s %-8s %-10s %s\n' \
@@ -302,10 +403,12 @@ esac
 # The cap is fleet-wide, so it is divided by COUNT and re-applied on every
 # start -- changing the cap just means re-running this script.
 CAP_KBIT=0
-if [ "$CAP_MBPS" -gt 0 ]; then
-  CAP_KBIT=$(( (CAP_MBPS * 8000 + COUNT - 1) / COUNT ))
+if [ "$CAP_KBPS" -gt 0 ]; then
+  # KB/s -> kbit/s is exactly x8. Round the per-container share UP so the
+  # fleet total never exceeds the configured cap.
+  CAP_KBIT=$(( (CAP_KBPS * 8 + COUNT - 1) / COUNT ))
   if [ "$CAP_KBIT" -lt 8 ]; then
-    die "cap of ${CAP_MBPS}MB/s across $COUNT containers is below 8 kbit/s each — raise the cap or lower the count"
+    die "cap of ${CAP_KBPS}KB/s across $COUNT containers is below 8 kbit/s each — raise the cap or lower the count"
   fi
   # tbf requires burst >= ~10ms of traffic or it throttles BELOW the set
   # rate. A fixed 64kb burst silently caps any container above ~65 Mbit/s,
@@ -396,7 +499,7 @@ clear_cap() {
 # so changing the cap does not cost a reconnect.
 if [ "$CAPONLY" -eq 1 ]; then
   if [ "$CAP_KBIT" -eq 0 ]; then
-    log "no cap configured (URNETWORK_BANDWIDTH_CAP_MBPS=$CAP_MBPS) — clearing any existing shaping"
+    log "no cap configured (URNETWORK_BANDWIDTH_CAP_KBPS=$CAP_KBPS) — clearing any existing shaping"
     for i in $(seq 1 "$COUNT"); do clear_cap "urfix-$i"; done
     log "done"
     exit 0
@@ -404,7 +507,7 @@ if [ "$CAPONLY" -eq 1 ]; then
   if [ "$TC_OK" -ne 1 ]; then
     die "--cap needs root and tc/nsenter on the host (run with sudo)"
   fi
-  log "applying ${CAP_MBPS}MB/s fleet-wide = ${CAP_KBIT}kbit/s per container ($COUNT containers)"
+  log "applying ${CAP_KBPS}KB/s fleet-wide = ${CAP_KBIT}kbit/s per container ($COUNT containers)"
   rc=0
   for i in $(seq 1 "$COUNT"); do
     NAME="urfix-$i"
@@ -459,16 +562,58 @@ for i in $(seq 1 "$COUNT"); do
       ;;
   esac
 
-  # A proxy source is the difference between "provider is up" and
-  # "provider is earning". Mount it only when it has real entries: the
-  # entrypoint imports the file and warns "no valid servers" for a file
-  # that is only comments, so gate on line count, not on file size.
-  if [ -n "$PROXY_FILE" ] && [ -f "$PROXY_FILE" ] && [ "$PROXY_ENTRIES" -gt 0 ]; then
-    set -- "$@" -v "$PROXY_FILE:/app/proxy.txt:ro" -e PROXY_FILE=/app/proxy.txt
+  # Nodes 1..DIRECT_NODES run with NO proxy source, so their traffic
+  # leaves through this host's own connection: a real residential exit,
+  # which is what the network scores best. This is per-container because
+  # the proxy source is per-container: with the feed unset, a node has no
+  # proxies at all and falls back to `direct` on its own.
+  if [ "$i" -le "$DIRECT_NODES" ]; then
+    : # residential-only: deliberately no PROXY_URL and no proxy file
+  else
+    # Mount the file only when it has real entries: the entrypoint imports
+    # it and warns "no valid servers" for a comments-only file, so gate on
+    # line count, not on file size.
+    if [ -n "$PROXY_FILE" ] && [ -f "$PROXY_FILE" ] && [ "$PROXY_ENTRIES" -gt 0 ]; then
+      set -- "$@" -v "$PROXY_FILE:/app/proxy.txt:ro" -e PROXY_FILE=/app/proxy.txt
+    fi
+    if [ -n "$PROXY_URL" ]; then
+      set -- "$@" -e PROXY_URL="$PROXY_URL" \
+                -e PROXY_URL_REFRESH="$PROXY_URL_REFRESH" \
+                -e PROXY_URL_MAX="$PROXY_URL_MAX"
+    fi
   fi
   if [ -n "$SELF_HEAL" ]; then set -- "$@" -e URNETWORK_SELF_HEAL="$SELF_HEAL"; fi
 
+  # Hard ceilings, applied only when configured. memory-swap equal to
+  # memory disables swap for the container, so a node at its limit cannot
+  # push the host into swap thrash.
+  if [ "$MEM_PER_MB" -gt 0 ]; then
+    set -- "$@" --memory "${MEM_PER_MB}m" --memory-swap "${MEM_PER_MB}m"
+  fi
+  if [ "$CPU_PER_PCT" -gt 0 ]; then
+    _cpus="$(awk "BEGIN{printf \"%.2f\", $CPU_PER_PCT/100}")"
+    set -- "$@" --cpus "$_cpus"
+  fi
+
   docker run -d "$@" "$IMAGE" >/dev/null || die "failed to start $NAME"
+  if [ "$i" -le "$DIRECT_NODES" ]; then
+    log "$NAME role: residential (own IP, no proxies)"
+    # Unsetting PROXY_URL is not enough: proxies persisted in the state
+    # volume stay configured and the node keeps running `mode=mixed`.
+    # Clear them so the node really egresses from this host's own IP.
+    # Runs after the provider is up; it only edits config and reloads.
+    _cl=0
+    while [ "$_cl" -lt 20 ]; do
+      if docker exec "$NAME" sh -c 'test -S /root/.urnetwork/provider.sock' 2>/dev/null; then
+        docker exec "$NAME" urnet-tools proxy clear --force >/dev/null 2>&1 \
+          && log "$NAME cleared persisted proxies (now direct-only)"
+        break
+      fi
+      _cl=$((_cl + 1)); sleep 1
+    done
+  else
+    log "$NAME role: proxied"
+  fi
   if [ "$CAP_KBIT" -gt 0 ]; then
     if [ "$TC_OK" -eq 1 ]; then
       # The interface needs a moment to exist inside the new netns.
